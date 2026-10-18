@@ -8050,55 +8050,110 @@ function scan(html, base, set, quals){
   each(/"([^"]*\/[^"]+\.(?:mp4|m3u8)[^"]*)"/gi, h, m => addHttp(m[1], true));
 }
 
-const PROXIES = [
-  u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
-  u => 'https://corsproxy.io/?' + encodeURIComponent(u),
-  u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
-  u => 'https://thingproxy.freeboard.io/fetch/' + u,
-  u => 'https://cors.eu.org/' + u
+/* ---------- Pool de proxys CORS : classés par santé, avec disjoncteur ----------
+   Chaque proxy a un score (taux de réussite + latence) mémorisé dans le navigateur. Un proxy qui échoue
+   plusieurs fois d'affilée (ou répond 403/429) est mis en pause, puis réessayé plus tard. Les meilleurs partent
+   en premier ; les autres suivent en cascade. Tu peux en ajouter : fichier proxies.txt (un modèle par ligne,
+   avec {url} ou {encoded}) à côté de index.html, ou window.ORCO_PROXIES = ['https://…{encoded}', …]. */
+const enc = encodeURIComponent;
+const PROXY_DEFS = [
+  { n:'allorigins',      f:u => 'https://api.allorigins.win/raw?url=' + enc(u) },
+  { n:'allorigins-hexlet', f:u => 'https://allorigins.hexlet.app/raw?url=' + enc(u) },
+  { n:'allorigins-get',  f:u => 'https://api.allorigins.win/get?url=' + enc(u), j:'contents' },
+  { n:'corsproxy-io',    f:u => 'https://corsproxy.io/?' + enc(u) },
+  { n:'corsproxy-io-raw',f:u => 'https://corsproxy.io/?url=' + enc(u) },
+  { n:'codetabs',        f:u => 'https://api.codetabs.com/v1/proxy?quest=' + enc(u) },
+  { n:'thingproxy',      f:u => 'https://thingproxy.freeboard.io/fetch/' + u },
+  { n:'cors-eu-org',     f:u => 'https://cors.eu.org/' + u },
+  { n:'yacdn',           f:u => 'https://yacdn.org/proxy/' + u },
+  { n:'cors-lol',        f:u => 'https://api.cors.lol/?url=' + enc(u) },
+  { n:'corsproxy-org',   f:u => 'https://corsproxy.org/?' + enc(u) },
+  { n:'corsfix',         f:u => 'https://proxy.corsfix.com/?' + enc(u) },
+  { n:'whateverorigin',  f:u => 'https://www.whateverorigin.org/get?url=' + enc(u), j:'contents' },
+  { n:'htmldriven',      f:u => 'https://cors-proxy.htmldriven.com/?url=' + enc(u), j:'body' },
+  { n:'fringe',          f:u => 'https://cors-proxy.fringe.zone/' + u },
+  { n:'cf-workers-demo', f:u => 'https://test.cors.workers.dev/?' + u }
 ];
-/* Annulation + plafond de requêtes simultanées : quand on change d'épisode, les détections de l'ancien épisode sont
-   stoppées net (elles saturaient les proxys et les connexions du navigateur) ; l'épisode courant passe toujours en premier. */
+const EXTRA = [];
+const addProxyTemplate = (tpl, i) => {
+  tpl = String(tpl || '').trim();
+  if (!/^https?:\/\//i.test(tpl) || !/\{(?:url|encoded)\}/.test(tpl)) return;
+  const n = 'extra-' + (i ?? EXTRA.length);
+  if (EXTRA.some(x => x.n === n)) return;
+  EXTRA.push({ n, f:u => tpl.replace('{encoded}', enc(u)).replace('{url}', u) });
+};
+try { (window.ORCO_PROXIES || []).forEach(addProxyTemplate); } catch {}
+try { fetch('proxies.txt', { cache:'no-store' }).then(r => r.ok ? r.text() : '').then(tx => String(tx || '').split(/\r?\n/).filter(l => l.trim() && !l.trim().startsWith('#')).forEach(addProxyTemplate)).catch(() => {}); } catch {}
+
+const PH_KEY = 'orco_proxy_health_v2';
+let PH = {}; try { PH = JSON.parse(localStorage.getItem(PH_KEY)) || {}; } catch {}
+const phSave = (() => { let tm; return () => { clearTimeout(tm); tm = setTimeout(() => { try { localStorage.setItem(PH_KEY, JSON.stringify(PH)); } catch {} }, 800); }; })();
+const phGet = n => PH[n] || (PH[n] = { ok:0, fail:0, ms:0, streak:0, cool:0 });
+const phOk = (n, ms) => { const h = phGet(n); h.ok++; h.streak = 0; h.cool = 0; h.ms = h.ms ? h.ms * .7 + ms * .3 : ms; phSave(); };
+const phBad = (n, hard) => { const h = phGet(n); h.fail++; h.streak++; if (hard || h.streak >= 3) h.cool = Date.now() + Math.min(600000, (hard ? 120000 : 45000) * Math.pow(2, Math.min(3, h.streak - 1))); phSave(); };
+const phScore = n => { const h = phGet(n), tot = h.ok + h.fail; return ((tot ? (h.ok + 1) / (tot + 2) : .5) * 1000) - (h.ms || 1500) / 10; };
+const proxyList = () => {
+  const all = [...PROXY_DEFS, ...EXTRA], now = Date.now();
+  let live = all.filter(p => phGet(p.n).cool <= now);
+  if (live.length < 4) live = all;                       /* tous en pause : on retente quand même */
+  return live.sort((a, b) => phScore(b.n) - phScore(a.n));
+};
+
+/* Annulation + plafond de requêtes simultanées : quand on change de film, les détections de l'ancien sont
+   stoppées net ; la lecture courante passe toujours en premier. */
 const DEAD = new Set(), CUR = { key:'' };
-let _inflight = 0; const _q = [], MAX_INFLIGHT = 10;
+let _inflight = 0; const _q = [], MAX_INFLIGHT = 24;
 const slot = (isDead, tag = '') => new Promise(res => {
   const go = () => { if (isDead()){ res(false); return; } _inflight++; res(true); };
-  if (_inflight < MAX_INFLIGHT) go(); else if (tag && tag === CUR.key) _q.unshift(go); else _q.push(go);   /* l'épisode courant passe devant */
+  if (_inflight < MAX_INFLIGHT) go(); else if (tag && tag === CUR.key) _q.unshift(go); else _q.push(go);
 });
 const slotFree = () => { _inflight = Math.max(0, _inflight - 1); while (_q.length && _inflight < MAX_INFLIGHT) _q.shift()(); };
-const looksProxyError = t => t.length < 700 && /(forbidden|access denied|rate.?limit|too many|bad gateway|gateway time|cloudflare|not found|blocked|invalid url)/i.test(t) && !/\.(?:mp4|m3u8)/i.test(t);
+const looksProxyError = t => t.length < 700 && /(forbidden|access denied|rate.?limit|too many|bad gateway|gateway time|cloudflare|not found|blocked|invalid url|captcha|just a moment)/i.test(t) && !/\.(?:mp4|m3u8)/i.test(t);
 
-/* Lance en parallèle la lecture directe puis les proxys (les derniers légèrement décalés pour ne pas les saturer).
-   `onText(texte)` est appelé pour chaque réponse valide dans l'ordre d'arrivée ; s'il renvoie vrai, tout le reste est annulé. */
+/* Course : lecture directe + proxys (4 meilleurs tout de suite, les autres en cascade), puis une 2e passe sur les
+   meilleurs si tout a échoué. `onText(texte)` est appelé pour chaque réponse valide ; s'il renvoie vrai, le reste est annulé. */
 function fetchRace(url, onText, timeout = 7000, tag = ''){
   return new Promise(resolve => {
+    if (!/^https?:\/\//i.test(String(url || ''))){ resolve(false); return; }   /* durcissement : http(s) uniquement */
     let done = false, left = 0;
     const ctrls = [];
     const dead = () => !!tag && DEAD.has(tag);
     const deadT = setInterval(() => { if (dead()) finish(false); }, 250);
     const finish = v => { if (done) return; done = true; clearInterval(deadT); ctrls.forEach(c => { try { c.abort(); } catch {} }); resolve(v); };
-    const jobs = [[url, 0], ...PROXIES.map((p, i) => [p(url), i < 2 ? 0 : 150 * (i - 1)])];
+    const prox = proxyList();
+    const mk = (p, d) => ({ n:p.n, u:p.f(url), j:p.j, d });
+    const jobs = [{ n:'direct', u:url, d:0 },
+      ...prox.map((p, i) => mk(p, i < 4 ? 0 : Math.min(2600, 180 * (i - 3)))),
+      ...prox.slice(0, 4).map(p => mk(p, 4200))];
     left = jobs.length;
-    jobs.forEach(([u, delay]) => setTimeout(async () => {
+    jobs.forEach(job => setTimeout(async () => {
       if (done) return;
       const got = await slot(() => done || dead(), tag);
       if (!got){ if (--left === 0) finish(false); return; }
       const ctrl = new AbortController(); ctrls.push(ctrl);
       const to = setTimeout(() => ctrl.abort(), timeout);
-      let txt = null;
+      const t0 = performance.now();
+      let txt = null, status = 0;
       try {
-        const r = await fetch(u, { signal: ctrl.signal, credentials: 'omit', cache: 'no-store' });
-        if (r.ok) txt = await r.text();
+        const r = await fetch(job.u, { signal:ctrl.signal, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer' });
+        status = r.status;
+        if (r.ok){
+          txt = await r.text();
+          if (job.j){ try { const o = JSON.parse(txt); txt = String(o && o[job.j] != null ? o[job.j] : ''); } catch { txt = null; } }
+          if (txt && txt.length > 3e6) txt = txt.slice(0, 3e6);
+        }
       } catch {}
       clearTimeout(to);
       slotFree();
-      if (!done && txt && txt.length > 80 && !looksProxyError(txt)) {
+      const good = !!txt && txt.length > 80 && !looksProxyError(txt);
+      if (job.n !== 'direct' && !done){ if (good) phOk(job.n, performance.now() - t0); else phBad(job.n, status === 429 || status === 403); }
+      if (!done && good){
         let ok = false;
         try { ok = await onText(txt); } catch {}
         if (ok) return finish(true);
       }
       if (--left === 0) finish(false);
-    }, delay));
+    }, job.d));
   });
 }
 
@@ -8131,7 +8186,7 @@ function hostSpecific(host, url, html){
 
 function rank(set){
   const BAD = /\/(?:ads?|track|analytics|pixel|beacon|log)\/|googletagmanager|doubleclick|google-analytics|gtag|facebook\.com|twitter\.com|scorecard|banner|thumb|poster|sprite|preview\.jpg/i;
-  const arr = [...set].filter(u => isVid(u) && !BAD.test(u) && !(/\/embed[-/]/i.test(u) && !u.endsWith('.mp4') && !u.endsWith('.m3u8')));
+  const arr = [...set].filter(u => /^https?:\/\//i.test(u) && isVid(u) && !BAD.test(u) && !(/\/embed[-/]/i.test(u) && !u.endsWith('.mp4') && !u.endsWith('.m3u8')));
   const score = u => (/\.m3u8/i.test(u) ? 100 : /\.mp4/i.test(u) ? 80 : /\.mpd/i.test(u) ? 60 : 0)
     + (/cdn|cloudfront|akamai|fastly|delivery|stream|hls/i.test(u) ? 20 : 0) + (u.length < 300 ? 15 : 0) + (u.length < 150 ? 10 : 0);
   return arr.sort((a, b) => score(b) - score(a));
@@ -8299,22 +8354,38 @@ function hedged(url, tag = '', gaps = [0, 2500, 5500]){
 function detect(c){
   DEAD.delete(c.key);
   const all = srcList(c.item, c.lang);
-  const prim = all.filter(isPrimary), sec = all.filter(s => !isPrimary(s));
+  const hasPrim = all.some(isPrimary);
   return new Promise(resolve => {
-    let done = false, active = 0, secStarted = false;
-    const finish = r => { if (!done){ done = true; resolve(r); } };
-    const check = () => { if (done || active > 0) return; if (!secStarted) startSec(); else finish(null); };
-    const launch = list => list.forEach(s => {
-      active++;
-      (isPrimary(s) ? hedged(s.url, c.key) : withTimeout(extractVideoUrl(s.url, 0, c.key), 14000))
-        .then(r => { if (r) finish({ ...r, via: s.server, t: Date.now(), bad: new Set() }); })
+    if (!all.length){ resolve(null); return; }
+    const results = [];
+    let pending = all.length, done = false, grace = null;
+    const uniq = a => [...new Set(a.filter(Boolean))];
+    /* Choisit le gagnant (ShareCloudy d'abord s'il a répondu) et garde les flux des autres lecteurs comme secours. */
+    const decide = () => {
+      if (done || !results.length) return;
+      done = true; clearTimeout(grace);
+      const win = results.find(x => x.prim) || results[0];
+      const others = results.filter(x => x !== win);
+      win.alts = uniq([...(win.alts || []), ...others.flatMap(o => [o.url, ...(o.alts || [])])]).filter(u => u !== win.url).slice(0, 8);
+      win.pool = results.map(x => x.via);
+      resolve(win);
+    };
+    /* Tous les lecteurs sont interrogés EN PARALLÈLE ; le premier flux exploitable gagne (ShareCloudy a 1,2 s de grâce). */
+    all.forEach(s => {
+      const prim = isPrimary(s);
+      (prim ? hedged(s.url, c.key) : withTimeout(extractVideoUrl(s.url, 0, c.key), 14000))
+        .then(r => { if (r) results.push({ ...r, via:s.server, t:Date.now(), bad:new Set(), prim }); })
         .catch(() => {})
-        .then(() => { active--; check(); });
+        .then(() => {
+          pending--;
+          if (done) return;
+          if (results.length){
+            if (results.some(x => x.prim) || !hasPrim || pending === 0) decide();
+            else if (!grace) grace = setTimeout(decide, 1200);
+          } else if (pending === 0){ done = true; clearTimeout(grace); resolve(null); }
+        });
     });
-    const startSec = () => { if (secStarted || done) return; secStarted = true; launch(sec); check(); };
-    launch(prim);
-    if (!prim.length) startSec(); else setTimeout(startSec, 3500);
-    setTimeout(() => finish(null), 20000);
+    setTimeout(() => { if (done) return; if (results.length) decide(); else { done = true; clearTimeout(grace); resolve(null); } }, 20000);
   });
 }
 
@@ -8539,7 +8610,7 @@ async function startOrco(attempt = 0, resumeAt = 0){
     S.entry.bad = S.entry.bad || new Set();
     S.entry.bad.add(url);
     // au plus un flux de secours avant de redétecter (pas d'attente interminable)
-    const next = (attempt < 1 && S.entry.bad.size < 2) ? [S.entry.url, ...(S.entry.alts || [])].find(u => !S.entry.bad.has(u)) : null;
+    const next = (S.entry.bad.size < 6) ? [S.entry.url, ...(S.entry.alts || [])].find(u => !S.entry.bad.has(u)) : null;
     if (next){                       // flux de secours déjà connu : aucun délai de détection
       S.entry.url = next;
       killInner();
@@ -9222,7 +9293,7 @@ async function startOrco(attempt = 0, resumeAt = 0){
       enableWorker:true, capLevelToPlayerSize:false, startPosition: startAt > 0 ? startAt : -1,
       maxBufferLength: store.buf, maxMaxBufferLength: Math.round(store.buf * 1.6), backBufferLength:30,
       abrEwmaDefaultEstimate:2.5e6, startFragPrefetch:true,
-      manifestLoadingTimeOut:10000, manifestLoadingMaxRetry:2, levelLoadingMaxRetry:3, fragLoadingMaxRetry:4, fragLoadingTimeOut:20000
+      manifestLoadingTimeOut:10000, manifestLoadingMaxRetry:4, manifestLoadingRetryDelay:500, levelLoadingMaxRetry:5, levelLoadingRetryDelay:500, fragLoadingMaxRetry:6, fragLoadingRetryDelay:500, fragLoadingMaxRetryTimeout:8000, fragLoadingTimeOut:20000
     });
     hls.on(Hls.Events.MANIFEST_LOADED, bump); hls.on(Hls.Events.LEVEL_LOADED, bump);
     hls.on(Hls.Events.FRAG_LOADED, bump); hls.on(Hls.Events.FRAG_BUFFERED, bump);
@@ -9241,7 +9312,7 @@ async function startOrco(attempt = 0, resumeAt = 0){
     hls.on(Hls.Events.ERROR, (e, d) => {
       if (!d.fatal) return;
       if (d.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRec < 2){ mediaRec++; if (mediaRec === 2) { try { hls.swapAudioCodec(); } catch {} } hls.recoverMediaError(); return; }
-      if (d.type === Hls.ErrorTypes.NETWORK_ERROR && netRetry < 2){ netRetry++; later(() => { if (alive() && hls) hls.startLoad(); }, 600 * netRetry); return; }
+      if (d.type === Hls.ErrorTypes.NETWORK_ERROR && netRetry < 4){ netRetry++; later(() => { if (alive() && hls) hls.startLoad(); }, 500 * netRetry); return; }
       fail();
     });
     hls.attachMedia(video);
